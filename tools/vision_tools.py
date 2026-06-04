@@ -1140,6 +1140,8 @@ registry.register(
     check_fn=check_vision_requirements,
     is_async=True,
     emoji="👁️",
+    cacheable=True,
+    cacheable_ttl_seconds=86400,
 )
 
 

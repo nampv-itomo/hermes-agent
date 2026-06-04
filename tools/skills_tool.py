@@ -1494,6 +1494,8 @@ registry.register(
     ),
     check_fn=check_skills_requirements,
     emoji="📚",
+    cacheable=True,
+    cacheable_ttl_seconds=300,
 )
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count on success. Best-effort: a

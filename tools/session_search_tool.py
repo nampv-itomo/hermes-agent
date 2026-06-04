@@ -599,4 +599,6 @@ registry.register(
     ),
     check_fn=check_session_search_requirements,
     emoji="🔍",
+    cacheable=True,
+    cacheable_ttl_seconds=5,
 )

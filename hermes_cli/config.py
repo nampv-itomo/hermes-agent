@@ -1143,8 +1143,15 @@ DEFAULT_CONFIG = {
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
     # cache_ttl must be "5m" or "1h" (Anthropic-supported tiers); other values are ignored.
+    # tool_cache: opt-in flag for the in-process + on-disk tool result cache
+    #   (see agent/tool_result_cache.py).  Off by default in v1.0; flip to
+    #   True after a 2-week clean-telemetry soak period.  Individual tools
+    #   must STILL set cacheable=True in tools/registry.py:register() — this
+    #   flag is the master switch, not a per-tool override.
+    #   Override at runtime via HERMES_TOOL_CACHE_ENABLED=1 env var.
     "prompt_caching": {
         "cache_ttl": "5m",
+        "tool_cache": False,
     },
 
     # OpenRouter-specific settings.
@@ -5646,10 +5653,36 @@ def get_env_value(key: str) -> Optional[str]:
     # Check environment first
     if key in os.environ:
         return os.environ[key]
-    
+
     # Then check .env file
     env_vars = load_env()
     return env_vars.get(key)
+
+
+# Tool-result cache master switch.
+# Returns True when the cache is enabled.  Resolved in order:
+#   1. HERMES_TOOL_CACHE_ENABLED env var ("1"/"true"/"yes" = on; "0"/"false"/"no" = off)
+#   2. prompt_caching.tool_cache in user's effective config (DEFAULT_CONFIG
+#      default is False for v1.0 — flip to True after 2 weeks of clean
+#      production telemetry per the DevOps review)
+# Caches are NEVER on by default in v1.0.
+def is_tool_cache_enabled() -> bool:
+    env_raw = os.getenv("HERMES_TOOL_CACHE_ENABLED", "").strip().lower()
+    if env_raw in _MANAGED_TRUE_VALUES:
+        return True
+    if env_raw in ("0", "false", "no", "off", ""):
+        # empty string = "not set" → fall through to config; explicit off
+        # overrides the config flag so tests can force-disable cleanly.
+        if env_raw:
+            return False
+    try:
+        cfg = load_config_readonly()
+    except Exception:
+        cfg = None
+    if cfg is None:
+        return False
+    pc = cfg.get("prompt_caching", {}) if isinstance(cfg, dict) else {}
+    return bool(pc.get("tool_cache", False))
 
 
 # =============================================================================

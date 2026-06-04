@@ -511,6 +511,16 @@ def init_agent(
     # X-OpenRouter-Cache-Status: HIT is seen in streaming response headers.
     agent._or_cache_hits: int = 0
 
+    # Tool result cache counters (v1.0, 2026-06-04).  Mirrored from
+    # agent.tool_result_cache.get_default_cache().stats() so observability
+    # surfaces (/usage, gateway activity summary) can report cache savings
+    # without a separate DB round trip.  Reset on process restart; that's
+    # fine for v1.0.
+    agent._tool_cache_hits: int = 0
+    agent._tool_cache_misses: int = 0
+    agent._tool_cache_writes: int = 0
+    agent._tool_cache_errors: int = 0
+
     # Centralized logging — agent.log (INFO+) and errors.log (WARNING+)
     # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
     # (which creates a new AIAgent per message) won't duplicate handlers.

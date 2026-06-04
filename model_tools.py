@@ -809,6 +809,243 @@ def _tool_result_observer_fields(result: Any) -> tuple[str, Optional[str], Optio
     return "ok", None, None
 
 
+# =============================================================================
+# Tool result cache wrapper
+# =============================================================================
+# Opt-in, TTL-bounded memoization for read-only tool results.  The wrapper:
+# 1. Reads the master switch (HERMES_TOOL_CACHE_ENABLED or
+#    prompt_caching.tool_cache in config).
+# 2. Looks up ``entry.cacheable`` in the registry — must be True.
+# 3. On hit: returns the cached JSON, fires the post_tool_call hook with
+#    duration_ms=0 (Dev B2), and applies any transform_tool_result hooks
+#    the same way a fresh result would.
+# 4. On miss: dispatches normally, fires both hooks, and write-through
+#    after the transform has run.
+# Failure modes are absorbed by the cache layer itself (circuit breaker)
+# so a cache outage degrades to "no cache" without breaking the tool.
+
+def _is_tool_cache_active() -> bool:
+    """Read the master switch.  Returns False (cache bypassed) if either
+    the env var or the config flag is off, OR if the cache module
+    itself failed to import."""
+    try:
+        from hermes_cli.config import is_tool_cache_enabled
+        return bool(is_tool_cache_enabled())
+    except Exception:
+        return False
+
+
+# Per-thread flag set by cache_get_or_run when a cache hit occurred.
+# The handle_function_call wrapper reads this immediately after dispatch
+# so it can override duration_ms=0 for plugin observers (Dev B2).
+_cache_hit_tlocal = threading.local()
+
+
+def _consume_cache_hit_flag() -> bool:
+    """Read-and-clear the per-thread cache-hit flag.  Returns True if the
+    most recent cache_get_or_run call was a hit."""
+    flag = getattr(_cache_hit_tlocal, "hit", None)
+    if flag is not None:
+        try:
+            _cache_hit_tlocal.hit = None
+        except Exception:
+            pass
+    return bool(flag)
+
+
+def _resolve_ttl_seconds(entry, fallback: int) -> int:
+    """Return the TTL the cache should use for this tool.  Per-tool
+    override (``entry.cacheable_ttl_seconds``) wins; otherwise the
+    per-tool-class fallback (the calling wrapper passes the
+    DEFAULT_CONFIG key)."""
+    try:
+        ttl = int(getattr(entry, "cacheable_ttl_seconds", 0) or 0)
+    except (TypeError, ValueError):
+        ttl = 0
+    return ttl if ttl > 0 else fallback
+
+
+def _sync_agent_cache_counters(agent) -> None:
+    """Mirror the default cache's hit/miss/write/error counters onto
+    the AIAgent instance, if it has the slots.  Called opportunistically
+    after each cache_get_or_run() so /usage and the activity summary
+    see up-to-date numbers."""
+    if agent is None:
+        return
+    for attr in ("_tool_cache_hits", "_tool_cache_misses",
+                 "_tool_cache_writes", "_tool_cache_errors"):
+        if not hasattr(agent, attr):
+            return
+    try:
+        from agent.tool_result_cache import get_default_cache
+        stats = get_default_cache().stats()
+        agent._tool_cache_hits = stats["hits"]
+        agent._tool_cache_misses = stats["misses"]
+        agent._tool_cache_writes = stats["writes"]
+        agent._tool_cache_errors = stats["errors"]
+    except Exception:
+        # Cache not initialized (process never made a cacheable call)
+        # or another transient error.  Silently skip — the agent just
+        # keeps whatever counters it had.
+        pass
+
+
+def cache_get_or_run(
+    function_name: str,
+    function_args: Dict[str, Any],
+    dispatch_fn,
+    *,
+    session_id: Optional[str] = None,
+    agent_id: str = "",
+    fallback_ttl_seconds: int = 0,
+):
+    """Memoize a tool dispatch through the tool result cache.
+
+    * ``dispatch_fn(args)`` is the function that actually runs the tool
+      (it returns a JSON string, same contract as
+      ``registry.dispatch``).
+    * On a cache hit, ``dispatch_fn`` is NOT called and the cached
+      JSON is returned.  The post_tool_call + transform_tool_result
+      hooks still fire (with synthetic duration_ms=0) so plugin
+      observers see a complete call shape.
+    * On a miss, ``dispatch_fn`` runs and its result is written through
+      to the cache before being returned.
+    * On a cache layer error or disabled flag, falls back to a plain
+      ``dispatch_fn(args)`` call — no caching.
+    """
+    if not _is_tool_cache_active():
+        return dispatch_fn(function_args)
+
+    # Look up the registry entry; only cacheable tools are eligible.
+    try:
+        entry = registry.get_entry(function_name)
+    except Exception:
+        entry = None
+    if entry is None or not getattr(entry, "cacheable", False):
+        return dispatch_fn(function_args)
+
+    # Lazy import — the cache module opens a SQLite connection, we
+    # don't want to do that on every cold CLI start.
+    try:
+        from agent.tool_result_cache import get_default_cache, make_key  # noqa
+    except Exception as _import_err:
+        logger.debug("tool_result_cache import failed: %s — bypassing", _import_err)
+        return dispatch_fn(function_args)
+
+    cache = get_default_cache()
+    # Per-call scope: session_search and memory tools should pass
+    # session_id so a new message invalidates the entry.  For all
+    # other tools, leave session_id empty for cross-session sharing.
+    resolved_session_id = session_id or ""
+    resolved_agent_id = agent_id or ""
+
+    # 1) Lookup
+    try:
+        cached = cache.get(function_name, function_args,
+                           agent_id=resolved_agent_id,
+                           session_id=resolved_session_id)
+    except Exception:
+        cached = None
+    if cached is not None:
+        try:
+            _cache_hit_tlocal.hit = True
+        except Exception:
+            pass
+        return cached
+
+    # 2) Miss — run the dispatch
+    try:
+        _cache_hit_tlocal.hit = False
+    except Exception:
+        pass
+    result = dispatch_fn(function_args)
+
+    # 3) Write-through (post-dispatch).  Only cache successful results
+    # so a transient error doesn't poison the entry.  Errors are
+    # JSON-wrapped strings with a top-level "error" key (per
+    # registry.dispatch contract).
+    #
+    # NOTE: write-through is deferred — we store the candidate result on
+    # a thread-local and the actual cache.put() happens AFTER the
+    # transform_tool_result plugin runs (in handle_function_call).  This
+    # guarantees the cached value is the same one the conversation sees,
+    # including any plugin rewrites (Dev B2 / B9).
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+            is_error = isinstance(parsed, dict) and parsed.get("error")
+        except Exception:
+            is_error = False
+        if not is_error:
+            ttl = _resolve_ttl_seconds(entry, fallback_ttl_seconds)
+            if ttl > 0:
+                try:
+                    _cache_hit_tlocal.pending_put = (
+                        function_name, function_args, result, ttl,
+                        resolved_agent_id, resolved_session_id,
+                    )
+                except Exception:
+                    pass
+    # If we're called outside handle_function_call (e.g. from a unit
+    # test or an internal helper), there's no transform hook to wait
+    # for — flush immediately so the result is cached.  Production
+    # callers from handle_function_call set the defer flag explicitly
+    # so the cache reflects the post-transform result.
+    try:
+        defer = getattr(_cache_hit_tlocal, "defer_flush", False)
+    except Exception:
+        defer = False
+    if not defer:
+        try:
+            _flush_pending_cache_put()
+        except Exception:
+            pass
+    return result
+
+
+def _flush_pending_cache_put(latest_result: Optional[str] = None) -> None:
+    """Drain the pending write-through from cache_get_or_run's miss path.
+
+    Called by handle_function_call AFTER the transform_tool_result plugin
+    has run, so the cached value is byte-equal to what the conversation
+    sees.  If *latest_result* is provided, it replaces the result captured
+    at dispatch time — this is what allows a transform hook to rewrite
+    the cached value (Dev B2/B9).  Never raises — the cache layer's
+    circuit breaker handles errors.
+    """
+    pending = getattr(_cache_hit_tlocal, "pending_put", None)
+    if pending is None:
+        return
+    fn_name, fn_args, captured_result, ttl, agent_id, session_id = pending
+    try:
+        _cache_hit_tlocal.pending_put = None
+    except Exception:
+        pass
+    # If the caller passes a newer result (post-transform), use that;
+    # otherwise the value captured at dispatch time is the right one.
+    final_result = latest_result if latest_result is not None else captured_result
+    if not isinstance(final_result, str):
+        return
+    # Re-check for error shape — a transform may have wrapped an error.
+    try:
+        parsed = json.loads(final_result)
+        is_error = isinstance(parsed, dict) and parsed.get("error")
+        if is_error:
+            return
+    except Exception:
+        pass
+    try:
+        from agent.tool_result_cache import get_default_cache
+        cache = get_default_cache()
+    except Exception:
+        return
+    try:
+        cache.put(fn_name, fn_args, final_result, ttl,
+                  agent_id=agent_id, session_id=session_id)
+    except Exception:
+        pass
+
+
 def _emit_post_tool_call_hook(
     *,
     function_name: str,
@@ -1082,14 +1319,68 @@ def handle_function_call(
                         task_id=task_id,
                         user_task=user_task,
                     )
-            result = _dispatch(function_args)
+            # Tool result cache lookup (v1.0).  cache_get_or_run returns
+            # either the cached JSON (no _dispatch call) or the result
+            # of _dispatch(function_args) on miss.  The post_tool_call +
+            # transform_tool_result hooks below fire on BOTH paths so
+            # plugin observers see a complete call shape; on cache hit
+            # duration_ms is 0 and the result is not written through
+            # (cache layer already has it).
+            #
+            # Lookup uses the registry's per-tool cacheable flag as the
+            # hard allowlist; side-effecting tools (cacheable=False by
+            # default) are never memoized.
+            def _cached_dispatch(args: Dict[str, Any]) -> Any:
+                # Pick the per-tool-class fallback TTL from the tool
+                # entry.  cacheable_ttl_seconds is the per-tool
+                # override; if it's 0 we still try the canonical
+                # default by tool name (mirrors the tool-class
+                # defaults in the research brief).
+                _fallback_ttl = 0
+                try:
+                    _entry_for_ttl = registry.get_entry(function_name)
+                    if _entry_for_ttl is not None:
+                        # Use the per-tool TTL when set; otherwise
+                        # default 0 (no cache write).  The 5 tools
+                        # that opted in (web_search, web_extract,
+                        # session_search, vision_analyze, skills_list)
+                        # all set cacheable_ttl_seconds > 0 so this is
+                        # a no-op for them; tools that opt out have
+                        # cacheable=False and the wrapper returns
+                        # before reaching here.
+                        _fallback_ttl = int(getattr(_entry_for_ttl, "cacheable_ttl_seconds", 0) or 0)
+                except Exception:
+                    _fallback_ttl = 0
+                # Defer the cache write-through so the transform_tool_result
+                # plugin (if any) can rewrite `result` first.  handle_function_call
+                # will drain it via _flush_pending_cache_put(latest_result=result)
+                # after the transform hook runs.
+                try:
+                    _cache_hit_tlocal.defer_flush = True
+                except Exception:
+                    pass
+                return cache_get_or_run(
+                    function_name,
+                    args,
+                    _dispatch,
+                    session_id=session_id,
+                    agent_id="",
+                    fallback_ttl_seconds=_fallback_ttl,
+                )
+            result = _cached_dispatch(function_args)
         finally:
             if _approval_tokens is not None and reset_current_observability_context is not None:
                 try:
                     reset_current_observability_context(_approval_tokens)
                 except Exception:
                     pass
-        duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
+        # If the cache served this call, override duration_ms so plugin
+        # observers (post_tool_call / transform_tool_result) see
+        # duration_ms=0 (Dev B2 — synthetic on cache hit).
+        if _consume_cache_hit_flag():
+            duration_ms = 0
+        else:
+            duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 
         _emit_post_tool_call_hook(
             function_name=function_name,
@@ -1136,6 +1427,18 @@ def handle_function_call(
                         break
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
+
+        # Drain the deferred cache write-through AFTER any transform hook
+        # has had a chance to rewrite `result` (Dev B2/B9).  The cached
+        # value is therefore byte-equal to what the conversation sees.
+        try:
+            _flush_pending_cache_put(latest_result=result)
+        except Exception:
+            pass
+        try:
+            _cache_hit_tlocal.defer_flush = False
+        except Exception:
+            pass
 
         return result
 

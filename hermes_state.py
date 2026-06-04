@@ -33,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -301,11 +301,58 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+-- Tool result cache (opt-in per tool, TTL-bounded, agent-scoped).
+-- Stores the JSON-serialized result of a tool invocation, keyed by SHA-256
+-- of canonical(tool_name, args_json).  The cache lives in the same state.db
+-- as sessions/messages but is logically separate; the WAL-mode contention
+-- story is identical to other tables in this DB.
+--
+-- Columns:
+--   key TEXT PRIMARY KEY    -- SHA-256 hex of canonical (tool_name, args_json)
+--   tool_name TEXT NOT NULL -- for filter+invalidation by tool
+--   args_json TEXT NOT NULL -- canonical sorted-keys JSON of the args
+--   result_json TEXT NOT NULL -- JSON-serialized handler return value
+--   size_bytes INTEGER NOT NULL -- result_json size, for size-cap eviction
+--   created_at REAL NOT NULL -- unix ts of first write
+--   last_hit_at REAL NOT NULL -- unix ts of most recent read (LRU signal)
+--   hit_count INTEGER DEFAULT 0 -- monotonically increasing on hit
+--   ttl_seconds INTEGER NOT NULL -- per-tool TTL, from tool schema metadata
+--   expires_at REAL NOT NULL -- created_at + ttl_seconds; rows past this
+--                              -- are eligible for the hourly vacuum sweep
+--   hermes_profile TEXT NOT NULL DEFAULT '' -- forensic (which Hermes
+--                                             CLI profile wrote the row)
+--   agent_id TEXT NOT NULL DEFAULT '' -- cache-scope key (default '' = shared
+--                                       across agents; populated by callers
+--                                       to isolate session_search / memory
+--                                       to a single agent identity)
+--   session_id TEXT NOT NULL DEFAULT '' -- for invalidation when a new
+--                                         message is appended to a session
+--                                         (used by session_search, memory)
+CREATE TABLE IF NOT EXISTS tool_result_cache (
+    key TEXT PRIMARY KEY,
+    tool_name TEXT NOT NULL,
+    args_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    last_hit_at REAL NOT NULL,
+    hit_count INTEGER DEFAULT 0,
+    ttl_seconds INTEGER NOT NULL,
+    expires_at REAL NOT NULL,
+    hermes_profile TEXT NOT NULL DEFAULT '',
+    agent_id TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_tool_cache_expires ON tool_result_cache(expires_at);
+CREATE INDEX IF NOT EXISTS idx_tool_cache_tool ON tool_result_cache(tool_name, last_hit_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tool_cache_last_hit ON tool_result_cache(last_hit_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tool_cache_agent ON tool_result_cache(agent_id, expires_at);
 """
 
 # Indexes that reference columns added in later schema versions must be

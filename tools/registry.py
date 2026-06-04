@@ -81,11 +81,21 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        # Opt-in tool-result cache metadata (v1.0, 2026-06-04).
+        # Tools with side effects (write_file, send_message, terminal, etc.)
+        # MUST keep cacheable=False — the cache wrapper hard-rejects them
+        # and the registry default is False.  Only read-only / pure
+        # functions (web_search, web_extract, session_search, vision_analyze,
+        # skills_list) opt in.  cacheable_ttl_seconds is the per-tool TTL;
+        # 0 = "honor the configured default for this tool class" (resolved
+        # by the cache wrapper from hermes_cli.config.DEFAULT_CONFIG).
+        "cacheable", "cacheable_ttl_seconds",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 cacheable: bool = False, cacheable_ttl_seconds: int = 0):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -104,6 +114,8 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.cacheable = cacheable
+        self.cacheable_ttl_seconds = cacheable_ttl_seconds
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +257,8 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        cacheable: bool = False,
+        cacheable_ttl_seconds: int = 0,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -253,6 +267,13 @@ class ToolRegistry:
         default browser tool for a headed-Chrome CDP backend). Without it,
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
+
+        ``cacheable=True`` opts the tool into the in-process + on-disk tool
+        result cache (see agent/tool_result_cache.py).  Only safe for
+        read-only / pure functions whose result is fully determined by the
+        canonical args; side-effecting tools MUST leave this False.  When
+        True, ``cacheable_ttl_seconds`` is the per-tool TTL (overriding the
+        default for that tool class from hermes_cli.config.DEFAULT_CONFIG).
         """
         with self._lock:
             existing = self._tools.get(name)
@@ -299,6 +320,8 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                cacheable=cacheable,
+                cacheable_ttl_seconds=cacheable_ttl_seconds,
             )
             if check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
